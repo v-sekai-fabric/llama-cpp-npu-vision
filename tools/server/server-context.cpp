@@ -3447,6 +3447,24 @@ private:
 
                     bool has_mtmd = false;
 
+                    // Hailo NPU: kick off asynchronous encode of upcoming media chunks
+                    // so the NPU works in parallel with any pre-mtmd token decode.
+                    if (mtmd_supports_prefetch(mctx)) {
+                        std::vector<mtmd_input_chunk *> media;
+                        const size_t end = (size_t) slot.task->n_tokens();
+                        for (size_t p = slot.prompt.n_tokens(); p < end; ) {
+                            if (input_tokens[p] == LLAMA_TOKEN_NULL) {
+                                const auto & ch = input_tokens.find_chunk(p);
+                                media.push_back(ch.get());
+                                // n_tokens, not n_pos - p is a token index, and the two differ under mrope
+                                p += mtmd_input_chunk_get_n_tokens(ch.get());
+                            } else { ++p; }
+                        }
+                        if (!media.empty()) {
+                            mtmd_encode_prefetch(mctx, media.data(), media.size());
+                        }
+                    }
+
                     // check if we should process the mtmd chunk
                     while (true) {
                         auto cur_token_idx = slot.prompt.n_tokens();

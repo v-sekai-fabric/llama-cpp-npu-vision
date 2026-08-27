@@ -86,6 +86,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 | [Vulkan](docs/build.md#vulkan) | GPU |
 | [WebGPU](docs/build.md#webgpu) | All |
 | [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+| [Hailo NPU (vision encoder)](docs/multimodal-hailo.md) | Hailo-8 |
 
 ## Documentation
 

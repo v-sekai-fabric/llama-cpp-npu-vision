@@ -26,6 +26,8 @@ struct mtmd_image_preproc_out {
     }
 };
 
+void mtmd_resize_image_u8(const clip_image_u8 & src, clip_image_u8 & dst, int target_width, int target_height);
+
 // base class, models must inherit from this class
 struct mtmd_image_preprocessor {
     const clip_hparams & hparams;

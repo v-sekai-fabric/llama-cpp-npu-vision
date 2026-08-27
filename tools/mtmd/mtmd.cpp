@@ -8,6 +8,10 @@
 
 #include "llama.h"
 
+#ifdef LLAMA_USE_HAILO
+#include "hailo/hailo_encoder.hpp"
+#endif
+
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -23,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <fstream>
 #include <type_traits>
 #include <vector>
 
@@ -142,6 +147,37 @@ void clip_image_f32_batch::deserialize(mtmd_serialization & ser) {
     }
 }
 
+#ifdef LLAMA_USE_HAILO
+// returns true if `path` looks like a Hailo .hef file - by suffix or, failing
+// that, by the 4-byte HEF magic (0x01 'H' 'E' 'F'). suffix check first to avoid
+// opening every non-HEF mmproj.
+static bool mtmd_is_path_hef(const char * path) {
+    if (path == nullptr) {
+        return false;
+    }
+
+    static constexpr char HEF_SUFFIX[] = ".hef";
+    static constexpr char HEF_MAGIC[]  = "\x01HEF";
+    constexpr size_t HEF_SUFFIX_LEN = sizeof(HEF_SUFFIX) - 1;  // exclude null terminator
+    constexpr size_t HEF_MAGIC_LEN  = sizeof(HEF_MAGIC)  - 1;
+
+    const std::string s = path;
+    if (s.size() >= HEF_SUFFIX_LEN
+            && s.compare(s.size() - HEF_SUFFIX_LEN, HEF_SUFFIX_LEN, HEF_SUFFIX) == 0) {
+        return true;
+    }
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    char buf[HEF_MAGIC_LEN] = {};
+    f.read(buf, HEF_MAGIC_LEN);
+    return (f.gcount() == static_cast<std::streamsize>(HEF_MAGIC_LEN))
+        && (std::memcmp(buf, HEF_MAGIC, HEF_MAGIC_LEN) == 0);
+}
+#endif
+
 // for still image data, layout is RGBRGBRGB...
 // length of data must be nx * ny * 3 bytes
 //
@@ -247,6 +283,13 @@ struct mtmd_image_tokens {
         return nx == other.nx && ny == other.ny && pos == other.pos;
     }
 
+#ifdef LLAMA_USE_HAILO
+    std::vector<unsigned char> hailo_input;   // raw RGB bytes at HEF input dims
+
+    // collects this image's encode; not copied by clone(), or two chunks would share one id
+    uint64_t hailo_encode_request_id = hailo_mtmd::NO_REQUEST_ID;
+#endif
+
     mtmd_image_tokens clone() {
         return mtmd_image_tokens{
             nx,
@@ -255,7 +298,11 @@ struct mtmd_image_tokens {
             image_idx,
             n_temporal_merge,
             batch_f32.clone(),
-            id
+            id,
+#ifdef LLAMA_USE_HAILO
+            hailo_input,
+            hailo_mtmd::NO_REQUEST_ID,   // not cloned; see the member
+#endif
         };
     }
 
@@ -477,12 +524,12 @@ mtmd_context_params mtmd_context_params_default() {
 }
 
 struct mtmd_context {
-    struct clip_ctx * ctx_v; // vision
-    struct clip_ctx * ctx_a; // audio
+    struct clip_ctx * ctx_v = nullptr; // vision
+    struct clip_ctx * ctx_a = nullptr; // audio
     std::vector<float> out_embd; // image embedding vector
 
     // generation context
-    struct clip_ctx * ctx_gen_a; // audio
+    struct clip_ctx * ctx_gen_a = nullptr; // audio
     std::vector<int32_t> gen_out_codes; // this frame's 16 sampled codes (GEN_CODE)
     std::vector<float>   gen_out_feats; // this frame's continuous features, if any (GEN_CODE)
     std::vector<float>   gen_out_embd;  // next-step hidden state fed back to backbone (GEN_CODE)
@@ -525,6 +572,10 @@ struct mtmd_context {
     // batching
     int32_t batch_max_tokens;
 
+#ifdef LLAMA_USE_HAILO
+    std::unique_ptr<hailo_mtmd::HailoVisionEncoder> hailo;  // set when --mmproj is a .hef
+#endif
+
     // TODO @ngxson : add timings
 
     mtmd_context(const char * mmproj_fname,
@@ -564,6 +615,14 @@ struct mtmd_context {
                     throw std::runtime_error(string_format("unsupported decoder rope type: %d\n", decoder_rope_type));
             }
         }
+
+#ifdef LLAMA_USE_HAILO
+        // .hef as --mmproj: HEF-only path, no GGUF loaded
+        if (mtmd_is_path_hef(mmproj_fname)) {
+            init_from_hef(mmproj_fname);
+            return;
+        }
+#endif
 
         clip_context_params ctx_clip_params {
             /* use_gpu           */ ctx_params.use_gpu,
@@ -623,6 +682,42 @@ struct mtmd_context {
             init_audio();
         }
     }
+
+#ifdef LLAMA_USE_HAILO
+    // open the Hailo encoder and pair it with a stub clip_ctx
+    void init_from_hef(const char * hef_path) {
+        hailo = std::make_unique<hailo_mtmd::HailoVisionEncoder>(hef_path);
+        LOG_INF("%s: Hailo encoder loaded from %s\n", __func__, hef_path);
+
+        // no-op normalization; HEF self-quantizes on-chip (values unused on the Hailo path but required by clip_ctx)
+        static const float qwen3_vl_image_mean[3] = {0.0f, 0.0f, 0.0f};
+        static const float qwen3_vl_image_std [3] = {1.0f, 1.0f, 1.0f};
+
+        ctx_v = clip_init_hailo(
+            /* proj_type          */ PROJECTOR_TYPE_QWEN3VL,
+            /* max_image_edge     */ static_cast<int32_t>(std::max(hailo->input_w(), hailo->input_h())),
+            /* patch_size         */ static_cast<int32_t>(hailo->patch_size()),
+            /* spatial_merge_size */ static_cast<int32_t>(hailo->spatial_merge_size()),
+            /* n_embd_per_stream  */ static_cast<int32_t>(hailo->n_embd_per_stream()),
+            /* n_deepstack_layers */ static_cast<int32_t>(hailo->n_streams()) - 1,
+            qwen3_vl_image_mean,
+            qwen3_vl_image_std);
+        if (ctx_v == nullptr) {
+            throw std::runtime_error("clip_init_hailo failed");
+        }
+
+        // same n_embd validation the GGUF path performs
+        const int n_embd_clip = clip_n_mmproj_embd(ctx_v);
+        if (n_embd_text != n_embd_clip) {
+            throw std::runtime_error(string_format(
+                "mismatch between text model (n_embd_inp = %d) and HEF (n_embd_inp = %d).\n",
+                n_embd_text, n_embd_clip));
+        }
+
+        init_vision();
+        out_embd.reserve(static_cast<size_t>(hailo->n_image_tokens()) * hailo->n_embd_inp());
+    }
+#endif
 
     void init_vision() {
         GGML_ASSERT(ctx_v != nullptr);
@@ -1337,6 +1432,60 @@ struct mtmd_tokenizer {
 
             mtmd_image_preproc_out preproc_out;
 
+#ifdef LLAMA_USE_HAILO
+            if (ctx->hailo) {
+                // Hailo path: the HEF accepts raw uint8 input, so the resize and
+                // token-grid derivation are performed locally rather than via image_preproc.
+                // TODO(hailo-upstream-drift): Hailo commit predates the multi-bitmap
+                // frame-merge loop; today it processes one image per call.
+                GGML_ASSERT(bitmaps.size() == 1);
+                const auto * bmp = bitmaps[0];
+                GGML_ASSERT(!bmp->is_audio);
+                if (bmp->nx <= 0 || bmp->ny <= 0) {
+                    LOG_ERR("%s: error: invalid bitmap dimensions: nx = %d, ny = %d\n",
+                            __func__, bmp->nx, bmp->ny);
+                    return 2;
+                }
+
+                clip_image_u8 img_u8;
+                img_u8.set_size({(int)bmp->nx, (int)bmp->ny}, bmp->is_placeholder());
+                img_u8.cpy_buf(bmp->get_ro_buf());
+
+                const int in_w = static_cast<int>(ctx->hailo->input_w());
+                const int in_h = static_cast<int>(ctx->hailo->input_h());
+                clip_image_u8 resized_u8;
+                if ((int)img_u8.get_size().width != in_w || (int)img_u8.get_size().height != in_h) {
+                    mtmd_resize_image_u8(img_u8, resized_u8, in_w, in_h);
+                } else {
+                    resized_u8.set_size({in_w, in_h}, img_u8.is_placeholder());
+                    resized_u8.cpy_buf(img_u8.get_ro_buf());
+                }
+
+                auto image_tokens = std::make_unique<mtmd_image_tokens>();
+                const uint32_t stride = ctx->hailo->patch_size() * ctx->hailo->spatial_merge_size();
+                image_tokens->nx          = ctx->hailo->input_w() / stride;
+                image_tokens->ny          = ctx->hailo->input_h() / stride;
+                image_tokens->pos         = ctx->pos_type;
+                image_tokens->image_idx   = n_images_added;
+                image_tokens->id          = bmp->id;
+                image_tokens->hailo_input = resized_u8.get_ro_buf();
+
+                mtmd_input_chunk chunk{
+                    MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                    {},
+                    std::move(image_tokens),
+                    nullptr,
+                };
+                cur.entries.emplace_back(std::move(chunk));
+
+                if (!ctx->img_end.empty()) {
+                    add_text(ctx->img_end, true);
+                }
+                n_images_added++;
+                return 0;
+            }
+#endif
+
             for (const auto * bmp : bitmaps) {
                 // sanity check
                 GGML_ASSERT(!bmp->is_audio);
@@ -1713,6 +1862,19 @@ struct mtmd_tokenizer {
     }
 };
 
+#ifdef LLAMA_USE_HAILO
+static bool hailo_can_encode(const mtmd_input_chunk * c) {
+    return c && c->type == MTMD_INPUT_CHUNK_TYPE_IMAGE && c->tokens_image
+        && !c->tokens_image->hailo_input.empty();
+}
+
+// the HEF is fixed at load time, so a mismatch means the wrong model, not a bad image
+static bool hailo_dims_check(mtmd_context * ctx, const mtmd_image_tokens & img) {
+    return static_cast<int>(img.n_tokens()) == static_cast<int>(ctx->hailo->n_image_tokens())
+        && ctx->n_embd_text == static_cast<int>(ctx->hailo->n_embd_inp());
+}
+#endif
+
 int32_t mtmd_tokenize(mtmd_context * ctx,
             mtmd_input_chunks * output,
             const mtmd_input_text * text,
@@ -1765,6 +1927,33 @@ static int32_t mtmd_encode_chunk_impl(mtmd_context * ctx, const mtmd_input_chunk
             LOG_ERR("%s: image tokens are null\n", __func__);
             return 1;
         }
+#ifdef LLAMA_USE_HAILO
+        if (ctx->hailo && hailo_can_encode(chunk)) {
+            // non-const through the unique_ptr: this chunk's encode id is consumed here
+            auto * img = chunk->tokens_image.get();
+
+            if (!hailo_dims_check(ctx, *img)) {
+                LOG_ERR("%s: HEF/model mismatch (n_tokens=%d/%u, n_embd_inp=%d/%u)\n",
+                        __func__, static_cast<int>(img->n_tokens()), ctx->hailo->n_image_tokens(),
+                        ctx->n_embd_text, ctx->hailo->n_embd_inp());
+                return 1;
+            }
+            out_embd.resize(static_cast<size_t>(img->n_tokens()) * ctx->n_embd_text);
+
+            // nothing prefetched it, or its slot was recycled since; either way, encode it now
+            if (!ctx->hailo->owns(img->hailo_encode_request_id)
+                && !ctx->hailo->submit(img->hailo_encode_request_id,
+                                       img->hailo_input.data(), img->hailo_input.size())) {
+                LOG_ERR("%s: Hailo submit failed\n", __func__);
+                return 1;
+            }
+            if (!ctx->hailo->wait(img->hailo_encode_request_id, out_embd.data())) {
+                LOG_ERR("%s: Hailo encode failed\n", __func__);
+                return 1;
+            }
+            return 0;
+        }
+#endif
         if (chunk->tokens_image->is_placeholder()) {
             LOG_ERR("%s: image tokens batch is placeholder\n", __func__);
             return 1;
@@ -2121,6 +2310,48 @@ float * mtmd_batch_get_output_embd(mtmd_batch * batch, const mtmd_input_chunk * 
         }
     }
     return nullptr; // not found
+}
+
+bool mtmd_supports_prefetch(const mtmd_context * ctx) {
+#ifdef LLAMA_USE_HAILO
+    return ctx && ctx->hailo != nullptr;
+#else
+    (void) ctx;
+    return false;
+#endif
+}
+
+void mtmd_encode_prefetch(mtmd_context * ctx, mtmd_input_chunk ** chunks, size_t n_chunks) {
+#ifdef LLAMA_USE_HAILO
+    if (!ctx || !ctx->hailo || !chunks) {
+        return;
+    }
+
+    // nothing is remembered between calls, so interleaving callers cannot disturb each other
+    for (size_t i = 0; i < n_chunks; ++i) {
+        auto * c = chunks[i];
+        if (!hailo_can_encode(c)) {
+            continue;
+        }
+        auto * img = c->tokens_image.get();
+        if (ctx->hailo->owns(img->hailo_encode_request_id)) {
+            continue;   // already in flight or waiting to be collected
+        }
+        // try_submit() clears the id first, so a stale one cannot keep this image out of the pipeline
+        const auto st = ctx->hailo->try_submit(img->hailo_encode_request_id,
+                                               img->hailo_input.data(), img->hailo_input.size());
+        if (st == hailo_mtmd::HailoVisionEncoder::SubmitStatus::unsupported) {
+            LOG_ERR("%s: image does not fit the HEF input (%zu bytes, expected %ux%u); not prefetched\n",
+                    __func__, img->hailo_input.size(), ctx->hailo->input_w(), ctx->hailo->input_h());
+            continue;
+        }
+        if (st != hailo_mtmd::HailoVisionEncoder::SubmitStatus::started) {
+            break;      // nothing more can start right now, so nothing behind it can either
+        }
+    }
+#else
+    (void) ctx; (void) chunks; (void) n_chunks;
+#endif
 }
 
 bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk) {
