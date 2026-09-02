@@ -481,7 +481,10 @@ private:
 };
 
 void mtmd_resize_image_u8(const clip_image_u8 & src, clip_image_u8 & dst, int target_width, int target_height) {
-    img_tool::resize(src, dst, {target_width, target_height}, RESIZE_ALGO_BILINEAR, /*add_padding=*/false);
+    // TODO(hailo-upstream-drift): the Hailo commit called img_tool::resize with an
+    // add_padding=false bool; upstream replaced that arg with a pad_style enum.
+    // PAD_NONE preserves the original no-padding intent.
+    img_tool::resize(src, dst, {target_width, target_height}, RESIZE_ALGO_BILINEAR, PAD_NONE);
 }
 
 
