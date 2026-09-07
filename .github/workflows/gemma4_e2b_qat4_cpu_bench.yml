@@ -1,0 +1,118 @@
+# One-shot CPU measurement: Gemma 4 E2B, Google's QAT Q4_0 GGUF, on a GitHub-hosted
+# runner, through the workspace's TurboQuant llama.cpp (turboquant-godot's vendored
+# tree) with upstream llama.cpp as the baseline on the same machine. The table lands in
+# the job summary and as an artifact. Nothing here runs on rented GPUs or on Fly.
+name: gemma4-e2b-qat4-cpu-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: repetitions per llama-bench test
+        default: "3"
+      fork_ref:
+        description: turboquant-godot ref to measure
+        default: feat/turboquant-on-master
+  push:
+    branches: [magi/gemma4-e2b-qat4-cpu-bench]
+    paths: [.github/workflows/gemma4_e2b_qat4_cpu_bench.yml]
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      MODEL_URL: https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/gemma-4-E2B_q4_0-it.gguf
+      RUNS: ${{ github.event.inputs.runs || '3' }}
+      FORK_REF: ${{ github.event.inputs.fork_ref || 'feat/turboquant-on-master' }}
+    steps:
+      - name: Runner
+        run: |
+          nproc
+          grep -m1 "model name" /proc/cpuinfo
+          free -g | head -n 2
+          df -h / | tail -n 1
+
+      - name: Checkout the TurboQuant fork's llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: V-Sekai-fire/turboquant-godot
+          ref: ${{ env.FORK_REF }}
+          path: fork
+          sparse-checkout: thirdparty/llama_cpp
+          sparse-checkout-cone-mode: true
+
+      - name: Checkout upstream llama.cpp for the baseline
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          path: upstream
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake build-essential libcurl4-openssl-dev
+
+      - name: Build the fork's llama-bench and llama-quantize
+        working-directory: fork/thirdparty/llama_cpp
+        run: |
+          # The vendored tree carries no tools/mtmd/debug sources, and llama-bench needs none of mtmd.
+          sed -i 's/^\(\s*\)add_subdirectory(mtmd)/\1# mtmd skipped: debug sources are not vendored/' tools/CMakeLists.txt
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
+          cmake --build build -j "$(nproc)" --target llama-bench llama-quantize
+          git -C ../.. rev-parse --short HEAD > ../../../fork.sha
+
+      - name: Build upstream llama-bench
+        working-directory: upstream
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
+          cmake --build build -j "$(nproc)" --target llama-bench
+
+      - name: Model
+        run: |
+          curl -sL -o model.gguf "$MODEL_URL"
+          ls -l model.gguf
+
+      - name: TurboQuant TQ4_1S weights from the QAT weights, for speed only
+        run: |
+          Q=fork/thirdparty/llama_cpp/build/bin/llama-quantize
+          if "$Q" --help 2>&1 | grep -q "TQ4_1S"; then
+            "$Q" --allow-requantize model.gguf model-tq4_1s.gguf TQ4_1S "$(nproc)" | tail -n 3
+          else
+            echo "llama-quantize lists no TQ4_1S; the row is skipped" | tee tq4-skipped.txt
+          fi
+
+      - name: Bench
+        run: |
+          T=$(nproc)
+          FB=fork/thirdparty/llama_cpp/build/bin/llama-bench
+          UB=upstream/build/bin/llama-bench
+          {
+            echo "## Gemma 4 E2B, Google QAT Q4_0 GGUF, CPU, ubuntu-latest"
+            echo
+            echo "Runner: $T threads,$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2). Reading speed anchor: about 4 to 5 words per second, about 6 tokens per second. Prompt 128 tokens (pp128), generation 64 tokens (tg64), $RUNS repetitions."
+            echo
+            echo "### upstream llama.cpp $(git -C upstream rev-parse --short HEAD), Q4_0 weights, f16 KV"
+            "$UB" -m model.gguf -p 128 -n 64 -t "$T" -r "$RUNS" -o md 2>/dev/null
+            echo
+            echo "### fork turboquant-godot $(cat fork.sha) ($FORK_REF), Q4_0 weights, f16 KV"
+            "$FB" -m model.gguf -p 128 -n 64 -t "$T" -r "$RUNS" -o md 2>/dev/null
+            echo
+            echo "### fork, Q4_0 weights, TurboQuant turbo4 KV cache"
+            "$FB" -m model.gguf -p 128 -n 64 -t "$T" -r "$RUNS" -ctk turbo4 -ctv turbo4 -o md 2>/dev/null || echo "turbo4 KV cache: llama-bench refused it (see the log)"
+            if [ -f model-tq4_1s.gguf ]; then
+              echo
+              echo "### fork, TQ4_1S weights (requantized from Q4_0, speed only), f16 KV"
+              "$FB" -m model-tq4_1s.gguf -p 128 -n 64 -t "$T" -r "$RUNS" -o md 2>/dev/null
+            else
+              echo
+              cat tq4-skipped.txt
+            fi
+          } | tee bench.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gemma4-e2b-qat4-cpu-bench
+          path: bench.md
