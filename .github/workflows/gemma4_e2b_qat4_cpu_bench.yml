@@ -61,7 +61,10 @@ jobs:
           # GGML_BACKEND_DL is not optional in this tree: ggml-backend-dl.cpp is compiled
           # unconditionally while its header defines dl_handle only under that flag.
           # Dynamic loading moves backend discovery to startup and leaves throughput alone.
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_BACKEND_DL=ON \
+          # Both trees take the flags upstream's own cpu.Dockerfile uses: the fork's ggml
+          # needs GGML_BACKEND_DL to compile at all, and that flag refuses GGML_NATIVE, so
+          # every variant is built and dispatched at runtime. Identical flags, one runner.
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
           cmake --build build -j "$(nproc)" --target llama-bench llama-quantize
           git -C ../.. rev-parse --short HEAD > ../../../fork.sha
@@ -69,7 +72,7 @@ jobs:
       - name: Build upstream llama-bench
         working-directory: upstream
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
           cmake --build build -j "$(nproc)" --target llama-bench
 
