@@ -58,7 +58,10 @@ jobs:
         run: |
           # The vendored tree carries no tools/mtmd/debug sources, and llama-bench needs none of mtmd.
           sed -i 's/^\(\s*\)add_subdirectory(mtmd)/\1# mtmd skipped: debug sources are not vendored/' tools/CMakeLists.txt
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
+          # GGML_BACKEND_DL is not optional in this tree: ggml-backend-dl.cpp is compiled
+          # unconditionally while its header defines dl_handle only under that flag.
+          # Dynamic loading moves backend discovery to startup and leaves throughput alone.
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_BACKEND_DL=ON \
             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
           cmake --build build -j "$(nproc)" --target llama-bench llama-quantize
           git -C ../.. rev-parse --short HEAD > ../../../fork.sha
