@@ -118,6 +118,23 @@ jobs:
             fi
           } | tee bench.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Guard rail
+        env:
+          TG64_MIN: '6.0'
+          PP128_MIN: '32.0'
+        run: |
+          python3 - "$TG64_MIN" "$PP128_MIN" <<'PY'
+          import re, sys
+          tg_min, pp_min = float(sys.argv[1]), float(sys.argv[2])
+          text = open("bench.md").read()
+          rows = re.findall(r"^\|\s*[^|]+\|.*?\|\s*(pp\d+|tg\d+)\s*\|\s*([0-9.]+)\s*\S", text, re.M)
+          tg = min((float(v) for k, v in rows if k.startswith("tg")), default=0.0)
+          pp = min((float(v) for k, v in rows if k.startswith("pp")), default=0.0)
+          print(f"floor: tg64 min {tg:.2f} tok/s (rail {tg_min}), pp128 min {pp:.2f} tok/s (rail {pp_min})")
+          if tg < tg_min or pp < pp_min:
+              sys.exit(f"latency guard rail: generation below reading speed. VRChat presence loop bound.")
+          PY
+
       - uses: actions/upload-artifact@v4
         with:
           name: gemma4-e2b-qat4-cpu-bench
