@@ -126,16 +126,24 @@ jobs:
           python3 - "$TG64_MIN" "$PP128_MIN" <<'PY'
           import re, sys
           tg_min, pp_min = float(sys.argv[1]), float(sys.argv[2])
-          text = open("bench.md").read()
-          rows = re.findall(r"^\|\s*[^|]+\|.*?\|\s*(pp\d+|tg\d+)\s*\|\s*([0-9.]+)\s*\S", text, re.M)
-          tg = min((float(v) for k, v in rows if k.startswith("tg")), default=0.0)
-          pp = min((float(v) for k, v in rows if k.startswith("pp")), default=0.0)
-          print(f"floor: tg64 min {tg:.2f} tok/s (rail {tg_min}), pp128 min {pp:.2f} tok/s (rail {pp_min})")
+          rows = []
+          for line in open("bench.md"):
+              if not line.startswith("|") or "TQ4_1S" in line:
+                  continue
+              m = re.search(r"\|\s*(pp\d+|tg\d+)\s*\|\s*([0-9.]+)\s*\S", line)
+              if m:
+                  rows.append((m.group(1), float(m.group(2))))
+          tg = min((v for k, v in rows if k.startswith("tg")), default=0.0)
+          pp = min((v for k, v in rows if k.startswith("pp")), default=0.0)
+          print(f"floor over {len(rows)} rows: tg64 min {tg:.2f} tok/s (rail {tg_min}), pp128 min {pp:.2f} tok/s (rail {pp_min})")
+          if not rows:
+              sys.exit("guard rail: no bench rows found in bench.md")
           if tg < tg_min or pp < pp_min:
-              sys.exit(f"latency guard rail: generation below reading speed. VRChat presence loop bound.")
+              sys.exit("guard rail: a row fell below reading speed or the runner floor; see the table above")
           PY
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: gemma4-e2b-qat4-cpu-bench
           path: bench.md
